@@ -286,6 +286,8 @@ void R3LIVE::service_process_img_buffer()
                 std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
                 std::this_thread::yield();
             }
+
+            // 从队列中取出这帧图像
             sensor_msgs::CompressedImageConstPtr msg = g_received_compressed_img_msg.front();
             try
             {
@@ -299,9 +301,11 @@ void R3LIVE::service_process_img_buffer()
                 printf( "Could not convert from '%s' to 'bgr8' !!! ", msg->format.c_str() );
             }
             mutex_image_callback.lock();
+            // 处理完这帧图像后，在队列中弹出
             g_received_compressed_img_msg.pop_front();
             mutex_image_callback.unlock();
         }
+        // 未压缩的图像，操作同上
         else
         {
             while ( g_received_img_msg.size() == 0 )
@@ -317,10 +321,12 @@ void R3LIVE::service_process_img_buffer()
             g_received_img_msg.pop_front();
             mutex_image_callback.unlock();
         }
+        // 对图像进行处理，去畸变、图像直方图均衡化等操作
         process_image( image_get, img_rec_time );
     }
 }
 
+// 压缩图像回调函数，例程
 void R3LIVE::image_comp_callback( const sensor_msgs::CompressedImageConstPtr &msg )
 {
     std::unique_lock< std::mutex > lock2( mutex_image_callback );
@@ -329,6 +335,9 @@ void R3LIVE::image_comp_callback( const sensor_msgs::CompressedImageConstPtr &ms
         return; // Avoid subscribe the same image twice.
     }
     sub_image_typed = 2;
+
+    // 把接受到的图片存放到g_received_compressed_img_msg队列中，
+    // 在service_process_img_buffer线程里进行轮询处理
     g_received_compressed_img_msg.push_back( msg );
     if ( g_flag_if_first_rec_img )
     {
@@ -364,64 +373,98 @@ int    total_frame_count = 0;
 void   R3LIVE::process_image( cv::Mat &temp_img, double msg_time )
 {
     cv::Mat img_get;
+
+    // 图像有效性检验
     if ( temp_img.rows == 0 )
     {
         cout << "Process image error, image rows =0 " << endl;
         return;
     }
 
+    // 时间检验
     if ( msg_time < last_accept_time )
     {
         cout << "Error, image time revert!!" << endl;
         return;
     }
 
+    // 如果两帧图像间隔小于9ms，与实际20Hz的频率相差太大，跳过这帧图像。
+    // m_control_image_freq 100hz
     if ( ( msg_time - last_accept_time ) < ( 1.0 / m_control_image_freq ) * 0.9 )
     {
         return;
     }
     last_accept_time = msg_time;
 
+    // m_camera_start_ros_tim 只在这儿用到了，初始值为-无穷
+    // 仅对第一帧图像进行如下操作
     if ( m_camera_start_ros_tim < 0 )
     {
         m_camera_start_ros_tim = msg_time;
+
+        // 图像的缩放因子 不缩放
+        // m_vio_image_width: 1280
+        // m_image_downsample_ratio 1
         m_vio_scale_factor = m_vio_image_width * m_image_downsample_ratio / temp_img.cols; // 320 * 24
         // load_vio_parameters();
+
+        // 将相机的内参和外参初值放在状态变量中
         set_initial_camera_parameter( g_lio_state, m_camera_intrinsic.data(), m_camera_dist_coeffs.data(), m_camera_ext_R.data(),
                                       m_camera_ext_t.data(), m_vio_scale_factor );
+        // Eigen内参和畸变系数 转换为OPENCV格式
         cv::eigen2cv( g_cam_K, intrinsic );
         cv::eigen2cv( g_cam_dist, dist_coeffs );
+        // 调用OPENCV的去畸变矫正函数
+        // Input : 相机内参、畸变系数、单位阵、图像的尺寸
+        // Output：输出原始图像和去畸变图像的像素的映射关系，后续调用remap函数进行去畸变 m_ud_map1 m_ud_map2
         initUndistortRectifyMap( intrinsic, dist_coeffs, cv::Mat(), intrinsic, cv::Size( m_vio_image_width / m_vio_scale_factor, m_vio_image_heigh / m_vio_scale_factor ),
                                  CV_16SC2, m_ud_map1, m_ud_map2 );
+        // 发布地图线程
         m_thread_pool_ptr->commit_task( &R3LIVE::service_pub_rgb_maps, this);
+        // VIO线程
         m_thread_pool_ptr->commit_task( &R3LIVE::service_VIO_update, this);
+        
+        // 地图路径与指针初始化
         m_mvs_recorder.init( g_cam_K, m_vio_image_width / m_vio_scale_factor, &m_map_rgb_pts );
         m_mvs_recorder.set_working_dir( m_map_output_dir );
     }
 
+    // 未缩放
     if ( m_image_downsample_ratio != 1.0 )
     {
         cv::resize( temp_img, img_get, cv::Size( m_vio_image_width / m_vio_scale_factor, m_vio_image_heigh / m_vio_scale_factor ) );
     }
     else
     {
+        // 不操作
         img_get = temp_img; // clone ?
     }
+
+    // 使用内参初始化当前图像的位姿
     std::shared_ptr< Image_frame > img_pose = std::make_shared< Image_frame >( g_cam_K );
     if ( m_if_pub_raw_img )
     {
+        // 记录图像
         img_pose->m_raw_img = img_get;
     }
+    //去畸变
+    // img_pose->m_img 为去畸变后的图像
     cv::remap( img_get, img_pose->m_img, m_ud_map1, m_ud_map2, cv::INTER_LINEAR );
     // cv::imshow("sub Img", img_pose->m_img);
+    // 保存时间
     img_pose->m_timestamp = msg_time;
+    // 彩色图像转换为灰度图
     img_pose->init_cubic_interpolation();
+    // 对灰度图及彩色图进行直方图均衡化，直方图均衡化后的图像的清晰度、对比度、图像质感有提高
     img_pose->image_equalize();
     m_camera_data_mutex.lock();
     m_queue_image_with_pose.push_back( img_pose );
     m_camera_data_mutex.unlock();
+
+    // 把经过去畸变和直方图均值化后的图片丢到队列中，等待service_VIO_update线程来处理
     total_frame_count++;
 
+    // 队列中最大积累了多少张图片没及时处理(应该是调试用的)
     if ( m_queue_image_with_pose.size() > buffer_max_frame )
     {
         buffer_max_frame = m_queue_image_with_pose.size();
@@ -470,11 +513,13 @@ void R3LIVE::load_vio_parameters()
 
 void R3LIVE::set_image_pose( std::shared_ptr< Image_frame > &image_pose, const StatesGroup &state )
 {
+    // 将IMU的位姿取出，根据外参转换为相机的位姿
     mat_3_3 rot_mat = state.rot_end;
     vec_3   t_vec = state.pos_end;
     vec_3   pose_t = rot_mat * state.pos_ext_i2c + t_vec;
     mat_3_3 R_w2c = rot_mat * state.rot_ext_i2c;
 
+    // 设置世界系到相机系下的位姿
     image_pose->set_pose( eigen_q( R_w2c ), pose_t );
     image_pose->fx = state.cam_intrinsic( 0 );
     image_pose->fy = state.cam_intrinsic( 1 );
@@ -482,6 +527,7 @@ void R3LIVE::set_image_pose( std::shared_ptr< Image_frame > &image_pose, const S
     image_pose->cy = state.cam_intrinsic( 3 );
 
     image_pose->m_cam_K << image_pose->fx, 0, image_pose->cx, 0, image_pose->fy, image_pose->cy, 0, 0, 1;
+    // 设置输出的颜色 调试用
     scope_color( ANSI_COLOR_CYAN_BOLD );
     // cout << "Set Image Pose frm [" << image_pose->m_frame_idx << "], pose: " << eigen_q(rot_mat).coeffs().transpose()
     // << " | " << t_vec.transpose()
@@ -556,10 +602,12 @@ bool R3LIVE::vio_preintegration( StatesGroup &state_in, StatesGroup &state_out, 
         return false;
     }
     mtx_buffer.lock();
+    // 取出imu_buffer_vio中的信息
     std::deque< sensor_msgs::Imu::ConstPtr > vio_imu_queue;
     for ( auto it = imu_buffer_vio.begin(); it != imu_buffer_vio.end(); it++ )
     {
         vio_imu_queue.push_back( *it );
+        // 预测当前帧的状态，肯定不能用未来的数据
         if ( ( *it )->header.stamp.toSec() > current_frame_time )
         {
             break;
@@ -569,6 +617,8 @@ bool R3LIVE::vio_preintegration( StatesGroup &state_in, StatesGroup &state_out, 
     while ( !imu_buffer_vio.empty() )
     {
         double imu_time = imu_buffer_vio.front()->header.stamp.toSec();
+        // 0.1 *2  5Hz
+        // 抛弃太久远以前的IMU时间信息？
         if ( imu_time < current_frame_time - 0.2 )
         {
             imu_buffer_vio.pop_front();
@@ -579,7 +629,9 @@ bool R3LIVE::vio_preintegration( StatesGroup &state_in, StatesGroup &state_out, 
         }
     }
     // cout << "Current VIO_imu buffer size = " << imu_buffer_vio.size() << endl;
+    // imu预积分 更新状态变量
     state_out = m_imu_process->imu_preintegration( state_out, vio_imu_queue, current_frame_time - vio_imu_queue.back()->header.stamp.toSec() );
+    // 输出增量 调试用
     eigen_q q_diff( state_out.rot_end.transpose() * state_in.rot_end );
     // cout << "Pos diff = " << (state_out.pos_end - state_in.pos_end).transpose() << endl;
     // cout << "Euler diff = " << q_diff.angularDistance(eigen_q::Identity()) * 57.3 << endl;
@@ -612,67 +664,100 @@ bool      R3LIVE::vio_esikf( StatesGroup &state_in, Rgbmap_tracker &op_track )
     tim.tic();
     scope_color( ANSI_COLOR_BLUE_BOLD );
     StatesGroup state_iter = state_in;
+    // 如果不在线估计内参，直接赋值
     if ( !m_if_estimate_intrinsic ) // When disable the online intrinsic calibration.
     {
         state_iter.cam_intrinsic << g_cam_K( 0, 0 ), g_cam_K( 1, 1 ), g_cam_K( 0, 2 ), g_cam_K( 1, 2 );
     }
 
+    // 如果不在线估计外参，直接赋值
     if ( !m_if_estimate_i2c_extrinsic )
     {
         state_iter.pos_ext_i2c = m_inital_pos_ext_i2c;
         state_iter.rot_ext_i2c = m_inital_rot_ext_i2c;
     }
 
+    // EKF的H R3LIVE 式13
     Eigen::Matrix< double, -1, -1 >                       H_mat;
+    // EKF的量测 R3LIVE 式15
     Eigen::Matrix< double, -1, 1 >                        meas_vec;
+    // 29维
     Eigen::Matrix< double, DIM_OF_STATES, DIM_OF_STATES > G, H_T_H, I_STATE;
+    // 增量
     Eigen::Matrix< double, DIM_OF_STATES, 1 >             solution;
+    // EKF的增益
     Eigen::Matrix< double, -1, -1 >                       K, KH;
+    //没用到
     Eigen::Matrix< double, DIM_OF_STATES, DIM_OF_STATES > K_1;
 
+    // 上述参数的稀疏表示
     Eigen::SparseMatrix< double > H_mat_spa, H_T_H_spa, K_spa, KH_spa, vec_spa, I_STATE_spa;
     I_STATE.setIdentity();
+    // http://eigen.tuxfamily.org/dox/classEigen_1_1SparseView.html
+    // 去掉0元素后的稀疏形式
     I_STATE_spa = I_STATE.sparseView();
+
+    // 内参与时间偏差
     double fx, fy, cx, cy, time_td;
 
+    // 投影到当前帧的地图点数量?
     int                   total_pt_size = op_track.m_map_rgb_pts_in_current_frame_pos.size();
+    // 上一次迭代的误差和这次迭代的误差
     std::vector< double > last_reprojection_error_vec( total_pt_size ), current_reprojection_error_vec( total_pt_size );
 
+    // 最少需要跟踪到10个点组成残差
     if ( total_pt_size < minimum_iteration_pts )
     {
         state_in = state_iter;
         return false;
     }
+    
+    // 2m * 29
     H_mat.resize( total_pt_size * 2, DIM_OF_STATES );
     meas_vec.resize( total_pt_size * 2, 1 );
     double last_repro_err = 3e8;
     int    avail_pt_count = 0;
     double last_avr_repro_err = 0;
 
+    // 累计重投影误差
     double acc_reprojection_error = 0;
     double img_res_scale = 1.0;
+
+    // 开始EKF迭代，迭代两次(两次线性化)，可能是考虑到计算量？
     for ( int iter_count = 0; iter_count < esikf_iter_times; iter_count++ )
     {
 
         // cout << "========== Iter " << iter_count << " =========" << endl;
+
+        // world to camera frame
+        // 从状态变量中取出当前迭代的相机位姿与IMU位姿
         mat_3_3 R_imu = state_iter.rot_end;
         vec_3   t_imu = state_iter.pos_end;
         vec_3   t_c2w = R_imu * state_iter.pos_ext_i2c + t_imu;
         mat_3_3 R_c2w = R_imu * state_iter.rot_ext_i2c; // world to camera frame
 
+        // 从状态变量中取出当前迭代的内参
         fx = state_iter.cam_intrinsic( 0 );
         fy = state_iter.cam_intrinsic( 1 );
         cx = state_iter.cam_intrinsic( 2 );
         cy = state_iter.cam_intrinsic( 3 );
+        // 从状态变量中取出当前迭代的时间偏差
         time_td = state_iter.td_ext_i2c_delta;
 
+        // 世界系到相机系的位姿
         vec_3   t_w2c = -R_c2w.transpose() * t_c2w;
         mat_3_3 R_w2c = R_c2w.transpose();
         int     pt_idx = -1;
+
+        // 累计重投影误差
         acc_reprojection_error = 0;
+        // 地图点在世界系和相机系下的表达
         vec_3               pt_3d_w, pt_3d_cam;
+        // 特征点的测量、投影以及特征点的速度
         vec_2               pt_img_measure, pt_img_proj, pt_img_vel;
+        // 补充材料-式S10
         eigen_mat_d< 2, 3 > mat_pre;
+        // 公式-补充材料-式 S14
         eigen_mat_d< 3, 3 > mat_A, mat_B, mat_C, mat_D, pt_hat;
         H_mat.setZero();
         solution.setZero();
@@ -680,12 +765,20 @@ bool      R3LIVE::vio_esikf( StatesGroup &state_in, Rgbmap_tracker &op_track )
         avail_pt_count = 0;
         for ( auto it = op_track.m_map_rgb_pts_in_last_frame_pos.begin(); it != op_track.m_map_rgb_pts_in_last_frame_pos.end(); it++ )
         {
+            // 地图点在世界坐标系下的3D坐标
             pt_3d_w = ( ( RGB_pts * ) it->first )->get_pos();
+            // 上一帧图像的特征点的运动速度
             pt_img_vel = ( ( RGB_pts * ) it->first )->m_img_vel;
+            // 上一帧追踪到的光流当前帧特征点
             pt_img_measure = vec_2( it->second.x, it->second.y );
+            // 地图点在当前相机帧下观测的3D坐标
             pt_3d_cam = R_w2c * pt_3d_w + t_w2c;
+            // 考虑时间矫正，地图点在当前相机帧下的2D投影坐标
             pt_img_proj = vec_2( fx * pt_3d_cam( 0 ) / pt_3d_cam( 2 ) + cx, fy * pt_3d_cam( 1 ) / pt_3d_cam( 2 ) + cy ) + time_td * pt_img_vel;
+            // 计算当前地图点重投影误差
             double repro_err = ( pt_img_proj - pt_img_measure ).norm();
+            // 根据重投影误差的大小，以及对应的Huber核函数，设置一下误差的比例因子
+            // http://ceres-solver.org/nnls_modeling.html#lossfunction
             double huber_loss_scale = get_huber_loss_scale( repro_err );
             pt_idx++;
             acc_reprojection_error += repro_err;
@@ -701,30 +794,46 @@ bool      R3LIVE::vio_esikf( StatesGroup &state_in, Rgbmap_tracker &op_track )
             avail_pt_count++;
             // Appendix E of r2live_Supplementary_material.
             // https://github.com/hku-mars/r2live/blob/master/supply/r2live_Supplementary_material.pdf
+            // 补充材料-式S10
             mat_pre << fx / pt_3d_cam( 2 ), 0, -fx * pt_3d_cam( 0 ) / pt_3d_cam( 2 ), 0, fy / pt_3d_cam( 2 ), -fy * pt_3d_cam( 1 ) / pt_3d_cam( 2 );
 
+            // 补充材料-式 S14 mat_A右边的
             pt_hat = Sophus::SO3d::hat( ( R_imu.transpose() * ( pt_3d_w - t_imu ) ) );
+            // 补充材料-式 S14-mat_A
             mat_A = state_iter.rot_ext_i2c.transpose() * pt_hat;
+            // 补充材料-式 S14-mat_B
             mat_B = -state_iter.rot_ext_i2c.transpose() * ( R_imu.transpose() );
+            // 补充材料-式 S14-mat_C
             mat_C = Sophus::SO3d::hat( pt_3d_cam );
+            // 补充材料-式 S14-mat_D
             mat_D = -state_iter.rot_ext_i2c.transpose();
+            // 误差向量 R3LIVE-式(15)
             meas_vec.block( pt_idx * 2, 0, 2, 1 ) = ( pt_img_proj - pt_img_measure ) * huber_loss_scale / img_res_scale;
 
+            // 处于行pt_idx * 2 列0 的2*3 大小的子矩阵 见R3LIVE-式13
+            // 对应旋转矩阵的扰动 补充材料-式 S8
             H_mat.block( pt_idx * 2, 0, 2, 3 ) = mat_pre * mat_A * huber_loss_scale;
+            // 对应平移向量的扰动。 补充材料-式 S8
             H_mat.block( pt_idx * 2, 3, 2, 3 ) = mat_pre * mat_B * huber_loss_scale;
+            // 估计时间偏移
             if ( DIM_OF_STATES > 24 )
             {
                 // Estimate time td.
+                // TODO 推导一个这个公式
                 H_mat.block( pt_idx * 2, 24, 2, 1 ) = pt_img_vel * huber_loss_scale;
                 // H_mat(pt_idx * 2, 24) = pt_img_vel(0) * huber_loss_scale;
                 // H_mat(pt_idx * 2 + 1, 24) = pt_img_vel(1) * huber_loss_scale;
             }
+            // 在线优化外参
             if ( m_if_estimate_i2c_extrinsic )
             {
+                // 与前同理 补充材料-式 S8
                 H_mat.block( pt_idx * 2, 18, 2, 3 ) = mat_pre * mat_C * huber_loss_scale;
                 H_mat.block( pt_idx * 2, 21, 2, 3 ) = mat_pre * mat_D * huber_loss_scale;
             }
 
+            // 在线估计内参
+            // TODO 推导一个这个公式
             if ( m_if_estimate_intrinsic )
             {
                 H_mat( pt_idx * 2, 25 ) = pt_3d_cam( 0 ) / pt_3d_cam( 2 ) * huber_loss_scale;
@@ -734,26 +843,39 @@ bool      R3LIVE::vio_esikf( StatesGroup &state_in, Rgbmap_tracker &op_track )
             }
         }
         H_mat = H_mat / img_res_scale;
+        // 平均每个点的重投影误差
         acc_reprojection_error /= total_pt_size;
 
         last_avr_repro_err = acc_reprojection_error;
+        // 本次迭代参与构建误差优化函数的点数，至少10个，小于10个继续计算H，否则就可以开始迭代了
         if ( avail_pt_count < minimum_iteration_pts )
         {
             break;
         }
 
+        // H
         H_mat_spa = H_mat.sparseView();
+        // H^T * sqrt{R^{-1}}
         Eigen::SparseMatrix< double > Hsub_T_temp_mat = H_mat_spa.transpose();
+        // R3LIVE-式18
         vec_spa = ( state_iter - state_in ).sparseView();
+        // H^T *R^{-1}* H
         H_T_H_spa = Hsub_T_temp_mat * H_mat_spa;
         // Notice that we have combine some matrix using () in order to boost the matrix multiplication.
+        // {H^T * R^{-1} *H + P^{-1}}^{-1} R3LIVE 式(17)
         Eigen::SparseMatrix< double > temp_inv_mat =
             ( ( H_T_H_spa.toDense() + eigen_mat< -1, -1 >( state_in.cov * m_cam_measurement_weight ).inverse() ).inverse() ).sparseView();
+
+        // KH
         KH_spa = temp_inv_mat * ( Hsub_T_temp_mat * H_mat_spa );
+
+        // R3LIVE-式18
         solution = ( temp_inv_mat * ( Hsub_T_temp_mat * ( ( -1 * meas_vec.sparseView() ) ) ) - ( I_STATE_spa - KH_spa ) * vec_spa ).toDense();
 
+        // 迭代更新 box加
         state_iter = state_iter + solution;
 
+        // 更新后的重投影误差变化小于0.01个像素
         if ( fabs( acc_reprojection_error - last_repro_err ) < 0.01 )
         {
             break;
@@ -763,11 +885,16 @@ bool      R3LIVE::vio_esikf( StatesGroup &state_in, Rgbmap_tracker &op_track )
 
     if ( avail_pt_count >= minimum_iteration_pts )
     {
+        // 协方差更新
+        // 通用公式 见R3LIVE-式31
         state_iter.cov = ( ( I_STATE_spa - KH_spa ) * state_iter.cov.sparseView() ).toDense();
     }
 
+    // 时间偏差补偿
     state_iter.td_ext_i2c += state_iter.td_ext_i2c_delta;
     state_iter.td_ext_i2c_delta = 0;
+
+    // 状态保存
     state_in = state_iter;
     return true;
 }
@@ -777,10 +904,14 @@ bool R3LIVE::vio_photometric( StatesGroup &state_in, Rgbmap_tracker &op_track, s
     Common_tools::Timer tim;
     tim.tic();
     StatesGroup state_iter = state_in;
+
+    // 如果不在线估计内参，直接赋值
     if ( !m_if_estimate_intrinsic )     // When disable the online intrinsic calibration.
     {
         state_iter.cam_intrinsic << g_cam_K( 0, 0 ), g_cam_K( 1, 1 ), g_cam_K( 0, 2 ), g_cam_K( 1, 2 );
     }
+
+    // 如果不在线估计外参，直接赋值
     if ( !m_if_estimate_i2c_extrinsic ) // When disable the online extrinsic calibration.
     {
         state_iter.pos_ext_i2c = m_inital_pos_ext_i2c;
