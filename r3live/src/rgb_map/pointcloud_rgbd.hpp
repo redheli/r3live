@@ -172,7 +172,7 @@ struct Global_map
     std::shared_ptr< std::thread >                               m_thread_service;
     int                                                          m_if_reload_init_voxel_and_hashed_pts = true;
 
-    Hash_map_3d< long, RGB_pt_ptr >   m_hashmap_3d_pts;
+    Hash_map_3d< long, RGB_pt_ptr >   m_hashmap_3d_pts; // store grid and its points
     Hash_map_3d< long, std::shared_ptr< RGB_Voxel > > m_hashmap_voxels;
     std::unordered_set< std::shared_ptr< RGB_Voxel > > m_voxels_recent_visited;
     std::vector< std::shared_ptr< RGB_pts > >          m_pts_last_hitted;

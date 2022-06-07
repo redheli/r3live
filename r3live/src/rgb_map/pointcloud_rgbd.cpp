@@ -528,6 +528,7 @@ void Global_map::selection_points_for_projection(std::shared_ptr<Image_frame> &i
     // int pts_size = m_rgb_pts_vec.size();
     std::vector<std::shared_ptr<RGB_pts>> pts_for_projection;
     m_mutex_m_box_recent_hitted->lock();
+    // use voxel, 点平均分布
     std::unordered_set< std::shared_ptr< RGB_Voxel > > boxes_recent_hitted = m_voxels_recent_visited;
     m_mutex_m_box_recent_hitted->unlock();
     if ( (!use_all_pts) && boxes_recent_hitted.size())
@@ -539,6 +540,7 @@ void Global_map::selection_points_for_projection(std::shared_ptr<Image_frame> &i
             // pts_for_projection.push_back( (*it)->m_pts_in_grid.back() );
             if ( ( *it )->m_pts_in_grid.size() )
             {
+                // only select one latest point for each voxel
                  pts_for_projection.push_back( (*it)->m_pts_in_grid.back() );
                 // pts_for_projection.push_back( ( *it )->m_pts_in_grid[ 0 ] );
                 // pts_for_projection.push_back( ( *it )->m_pts_in_grid[ ( *it )->m_pts_in_grid.size()-1 ] );

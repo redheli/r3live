@@ -759,7 +759,7 @@ bool      R3LIVE::vio_esikf( StatesGroup &state_in, Rgbmap_tracker &op_track )
             break;
         }
         last_repro_err = acc_reprojection_error;
-    }
+    } // end for
 
     if ( avail_pt_count >= minimum_iteration_pts )
     {

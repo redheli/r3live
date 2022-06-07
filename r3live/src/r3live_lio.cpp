@@ -989,7 +989,7 @@ int R3LIVE::service_LIO_update()
                         m_append_global_map_point_step );
                 }
                 stastic_cost_time.push_back( tim.toc( " ", 0 ) );
-            }
+            }// end if m_if_have_camera_data
             if(0) // Uncomment this code scope to enable the publish of effective points.
             {
                 /******* Publish effective points *******/
