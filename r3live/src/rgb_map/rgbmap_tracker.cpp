@@ -64,24 +64,33 @@ void Rgbmap_tracker::update_and_append_track_pts( std::shared_ptr< Image_frame >
     tim.tic();
     double                    u_d, v_d;
     int                       u_i, v_i;
+    // 允许的最大重投影误差
     double                    max_allow_repro_err = 2.0 * img_pose->m_img_cols / 320.0;
     Hash_map_2d< int, float > map_2d_pts_occupied;
 
+    // 取出对应的地图点，计算重投影误差
     for ( auto it = m_map_rgb_pts_in_last_frame_pos.begin(); it != m_map_rgb_pts_in_last_frame_pos.end(); )
     {
         RGB_pts *rgb_pt = ( ( RGB_pts * ) it->first );
         vec_3    pt_3d = ( ( RGB_pts * ) it->first )->get_pos();
+
+        // 在图像范围内则为true
         int      res = img_pose->project_3d_point_in_this_img( pt_3d, u_d, v_d, nullptr, 1.0 );
         u_i = std::round( u_d / mini_dis ) * mini_dis;
         v_i = std::round( v_d / mini_dis ) * mini_dis;
 
+        // it->second 是point在上一个image的u,v
+        // 后面会用u_d,v_d替换
+        // 重投影误差
         double error = vec_2( u_d - it->second.x, v_d - it->second.y ).norm();
 
+        // 大于允许的最大重投影误差
         if ( error > max_allow_repro_err )
         {
             // cout << "Remove: " << vec_2(it->second.x, it->second.y).transpose() << " | " << vec_2(u, v).transpose()
             // << endl;
             rgb_pt->m_is_out_lier_count++;
+            // 如果这个地图点经常被认为是外点或者重投影误差太大了，就把这个地图点删除
             if ( rgb_pt->m_is_out_lier_count > 1 || ( error > max_allow_repro_err * 2 ) )
             // if (rgb_pt->m_is_out_lier_count > 3)
             {
@@ -97,7 +106,9 @@ void Rgbmap_tracker::update_and_append_track_pts( std::shared_ptr< Image_frame >
 
         if ( res )
         {
+             // 计算地图点离相机的距离
             double depth = ( pt_3d - img_pose->m_pose_w2c_t ).norm();
+            // 如果当前像素没有对应的地图点，则添加该地图点
             if ( map_2d_pts_occupied.if_exist( u_i, v_i ) == false )
             {
                 map_2d_pts_occupied.insert( u_i, v_i, depth );
@@ -109,11 +120,13 @@ void Rgbmap_tracker::update_and_append_track_pts( std::shared_ptr< Image_frame >
             // m_map_rgb_pts_in_last_frame_pos.erase(it);
         }
         it++;
-    }
+    } // end for m_map_rgb_pts_in_last_frame_pos
 
     int new_added_pts = 0;
 
     tim.tic( "Add" );
+    // 当camera image 超前了global map的index
+    // max: 这里应该用timestamp做对比
     while ( map_rgb.m_updated_frame_index < img_pose->m_frame_idx - minimum_frame_diff )
     {
         std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
@@ -231,26 +244,44 @@ void Rgbmap_tracker::reject_error_tracking_pts( std::shared_ptr< Image_frame > &
 
 void Rgbmap_tracker::track_img( std::shared_ptr< Image_frame > &img_pose, double dis, int if_use_opencv )
 {
+    // 定时器
     Common_tools::Timer tim;
+
+    // 赋值
     m_current_frame = img_pose->m_img;
     m_current_frame_time = img_pose->m_timestamp;
+
+    // 当前帧的地图点
+    // !哪来的？
     m_map_rgb_pts_in_current_frame_pos.clear();
     if ( m_current_frame.empty() )
         return;
     cv::Mat frame_gray = img_pose->m_img_gray;
     tim.tic( "HE" );
     tim.tic( "opTrack" );
+    
+    // 保存每个点的跟踪状态？
+    // !
     std::vector< uchar > status;
     std::vector< float > err;
+
+    // 上一帧追到的特征点，这一帧继续追踪
     m_current_tracked_pts = m_last_tracked_pts;
+    // 上一帧追到的特征点的数目
     int before_track = m_last_tracked_pts.size();
+
+    // 追到的点太少了
+    // ! return回去还有其它操作吗？
     if ( m_last_tracked_pts.size() < 30 )
     {
         m_last_frame_time = m_current_frame_time;
         return;
     }
 
+    // Input : 灰度图，上一帧跟踪的点
+    // Output : 当前跟踪的点，以及每个点的状态
     m_lk_optical_flow_kernel->track_image( frame_gray, m_last_tracked_pts, m_current_tracked_pts, status, 2 );
+    // 数组瘦身，只保留有效的点
     reduce_vector( m_last_tracked_pts, status );
     reduce_vector( m_old_ids, status );
     reduce_vector( m_current_tracked_pts, status );
@@ -262,26 +293,40 @@ void Rgbmap_tracker::track_img( std::shared_ptr< Image_frame > &img_pose, double
     unsigned int pts_before_F = m_last_tracked_pts.size();
     mat_F = cv::findFundamentalMat( m_last_tracked_pts, m_current_tracked_pts, cv::FM_RANSAC, 1.0, 0.997, status );
     unsigned int size_a = m_current_tracked_pts.size();
+    // 数组瘦身，只保留有效的点
     reduce_vector( m_last_tracked_pts, status );
     reduce_vector( m_old_ids, status );
     reduce_vector( m_current_tracked_pts, status );
 
+    // 保存地图点在当前帧下跟踪到的坐标
     m_map_rgb_pts_in_current_frame_pos.clear();
+    // 帧间时间差
     double frame_time_diff = ( m_current_frame_time - m_last_frame_time );
+    // 寻找成功成功跟踪到的地图点
     for ( uint i = 0; i < m_last_tracked_pts.size(); i++ )
     {
+        // 跟踪到的点不在图像的边界处，认为有效(边缘图像经过了填充)
+        // @notes
         if ( img_pose->if_2d_points_available( m_current_tracked_pts[ i ].x, m_current_tracked_pts[ i ].y, 1.0, 0.05 ) )
         {
+            // 上一帧对应的地图点拿出来
             RGB_pts *rgb_pts_ptr = ( ( RGB_pts * ) m_rgb_pts_ptr_vec_in_last_frame[ m_old_ids[ i ] ] );
+            // 上一帧对应的地图点与当前跟踪的点简历联系
             m_map_rgb_pts_in_current_frame_pos[ rgb_pts_ptr ] = m_current_tracked_pts[ i ];
+            // 计算特征点的速度
             cv::Point2f pt_img_vel = ( m_current_tracked_pts[ i ] - m_last_tracked_pts[ i ] ) / frame_time_diff;
+            // 地图点与两帧的特征 双向联系建立
             rgb_pts_ptr->m_img_pt_in_last_frame = vec_2( m_last_tracked_pts[ i ].x, m_last_tracked_pts[ i ].y );
             rgb_pts_ptr->m_img_pt_in_current_frame =
                 vec_2( m_current_tracked_pts[ i ].x, m_current_tracked_pts[ i ].y );
+            // 存储一下图像特征点的运动速度，后面是ESIKF中用到。
+            // todo 需要整合一下
             rgb_pts_ptr->m_img_vel = vec_2( pt_img_vel.x, pt_img_vel.y );
         }
     }
 
+    // 小于0 没用到
+    // 利用预测结果过滤错误匹配
     if ( dis > 0 )
     {
         reject_error_tracking_pts( img_pose, dis );
@@ -290,6 +335,8 @@ void Rgbmap_tracker::track_img( std::shared_ptr< Image_frame > &img_pose, double
     m_old_gray = frame_gray.clone();
     m_old_frame = m_current_frame;
     m_map_rgb_pts_in_last_frame_pos = m_map_rgb_pts_in_current_frame_pos;
+
+    // 更新
     update_last_tracking_vector_and_ids();
 
     m_frame_idx++;
